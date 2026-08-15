@@ -1,0 +1,49 @@
+from dataclasses import dataclass
+from uuid import UUID
+
+from src.app.dto.payments import PaymentCreateRequestDTO, PaymentCreateResponseDTO
+from src.app.interfaces.units_of_work import ApplicationPaymentUnitOfWork
+from src.core import settings
+from src.domains.payments.domain.entities import PaymentEntity
+from src.domains.payments.exceptions import PaymentAlreadyExistsException, PaymentNotFoundException
+from src.infra.messaging.events.emitted.events import PaymentCreatedEvent
+from src.infra.outbox.schemes import OutboxMessageScheme
+
+
+@dataclass(frozen=True, slots=True)
+class CreatePaymentUseCase:
+    uow: ApplicationPaymentUnitOfWork
+
+    async def execute(self, idempotency_key: UUID, payment: PaymentCreateRequestDTO) -> PaymentCreateResponseDTO:
+        async with self.uow as uow:
+            existing = await uow.payments.get_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                return self._to_response(existing)
+
+            entity = PaymentEntity.create(idempotency_key=idempotency_key, **payment.as_dict())
+            try:
+                await uow.payments.add(entity)
+                await uow.outbox.add_msgs(self._get_outbox_msg(entity))
+                await uow.commit()
+            except PaymentAlreadyExistsException:
+                await uow.rollback()
+                entity = await uow.payments.get_by_idempotency_key(idempotency_key)
+                if entity is None:
+                    raise PaymentNotFoundException()
+
+        return self._to_response(entity)
+
+    @staticmethod
+    def _to_response(entity: PaymentEntity) -> PaymentCreateResponseDTO:
+        return PaymentCreateResponseDTO(
+            amount=entity.money.amount,
+            currency=entity.money.currency,
+            **entity.as_plain(),
+        )
+
+    @staticmethod
+    def _get_outbox_msg(entity: PaymentEntity) -> OutboxMessageScheme:
+        return OutboxMessageScheme(
+            body=PaymentCreatedEvent.model_validate(entity.as_plain()).as_dict(),
+            topic=settings.MESSAGING.PAYMENTS.TOPICS.NEW,
+        )

@@ -1,0 +1,31 @@
+DATABASE:
+  DRIVER: "postgresql+asyncpg"
+  HOST: postgres
+  PORT: 5432
+  IS_ECHO: no
+  POOL_SIZE: 10
+  MAX_OVERFLOW: 15
+
+BROKER:
+  HOST: rabbitmq
+  PORT: 5672
+  PROTOCOL: amqp
+
+MESSAGING:
+  MAX_RETRIES: 3
+  RETRY_TTL_MS: 5000
+  PAYMENTS:
+    TOPICS:
+      NEW: payments.new
+      NEW_RETRY: payments.new.retry
+      NEW_DEAD: payments.new.dead
+      WEBHOOKS: payments.webhooks
+      WEBHOOKS_RETRY: payments.webhooks.retry
+      WEBHOOKS_DEAD: payments.webhooks.dead
+
+LOGGING:
+  FORMAT: "%(asctime)s %(levelname)s %(message)s"
+  LEVEL: INFO
+
+TESTING:
+  DB_URL: "sqlite+aiosqlite:///:memory:"

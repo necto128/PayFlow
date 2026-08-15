@@ -1,203 +1,150 @@
-# Payment Processing Service
+# PayFlow
 
-Backend-сервис обработки платежей на **FastAPI** и **RabbitMQ** с **Outbox Pattern**.
+Асинхронный сервис приёма и обработки платежей.
 
----
-
-# Стек технологий
-
-* FastAPI
-* SQLAlchemy 2.0 (async)
-* PostgreSQL
-* RabbitMQ / FastStream
-* Alembic
-* Dishka
-* Poetry
-* Docker
-
----
-
-# Возможности
-
-* Создание и получение платежа
-* Идемпотентность через `Idempotency-Key`
-* Outbox Pattern для гарантированной публикации событий
-* Асинхронная обработка через RabbitMQ
-* Эмуляция внешнего платежного шлюза
-* Webhook после обработки платежа
-* Retry через DLX + TTL retry-очереди
-* Dead Letter Queue для исчерпавших retry сообщений
-* Unit и integration тесты
-
----
-
-## Структура проекта
-
-```
-src/
-├── app/           # API, DTO, use cases
-├── domains/       # доменная модель платежей
-├── infra/         # БД, RabbitMQ, outbox worker, consumer
-├── core/          # settings, security, базовые интерфейсы
-├── containers.py
-├── bootstrap.py
-└── main.py
+```text
+API ──► PostgreSQL (payment + outbox)
+              │
+              ▼
+        outbox_worker ──► RabbitMQ
+                              │
+                              ▼
+                         consumer
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+              status update         webhook POST
 ```
 
-## Подготовка
-
-```bash
-cp config.example.yml config.yml
-cp .env.example .env
-```
-
-Для Docker Compose достаточно `.env`; конфигурация берётся из `config.docker.yml`.
-
----
-
-## Запуск через Docker Compose
+## Quick start
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-Доступно:
+| Сервис | URL |
+|--------|-----|
+| API / Swagger | http://localhost:8080/docs |
+| RabbitMQ UI | http://localhost:15672 |
 
-* FastAPI — http://localhost:8080
-* Swagger — http://localhost:8080/docs
-* RabbitMQ Management — http://localhost:15672 (user/pass из `.env`)
-
-Сервисы:
-
-* `app` — REST API
-* `outbox_worker` — публикация outbox → RabbitMQ
-* `consumer_worker` — обработка платежей и webhook
-* `migrations` — `alembic upgrade head`
-* `postgres`, `rabbitmq`
-
----
-
-# Миграции
+Локально без Docker:
 
 ```bash
-alembic revision --autogenerate -m "init"
+cp config.example.yml config.yml
+cp .env.example .env
+poetry install
 alembic upgrade head
+poetry run uvicorn src.main:app --reload --port 8080
 ```
 
-В Docker миграции применяются сервисом `migrations` перед стартом API.
+Отдельно: `poetry run python -m src.infra.outbox` и `poetry run python -m src.infra.messaging`.
 
 ---
 
-# REST API
+## Стек
 
-## Создание платежа
+| Слой | Технологии |
+|------|------------|
+| API | FastAPI, Dishka |
+| Persistence | SQLAlchemy 2 (async), PostgreSQL, Alembic |
+| Messaging | RabbitMQ, FastStream |
+| Tooling | Poetry, Docker Compose, Ruff, pytest |
 
-### POST /api/v1/payments/
+---
 
-Headers:
+## Как устроен поток
 
-```http
-Idempotency-Key: 7e4a99b8-bb7d-4af6-9dbf-8f62d463bafb
-X-API-Key: SecretKey
+1. `POST /api/v1/payments/` создаёт платёж `PENDING` и outbox-событие в одной транзакции.
+2. `outbox_worker` публикует unpublished-записи в RabbitMQ (`FOR UPDATE SKIP LOCKED`).
+3. Consumer на `payments.new` эмулирует шлюз, в одной транзакции ставит `SUCCESS`/`FAILED`, `processed_at` и (если есть URL) кладёт webhook-событие в outbox.
+4. Consumer на `payments.webhooks` шлёт HTTP POST получателю.
+
+Доставка событий — **at-least-once**. Повторная обработка безопасна: статус меняется только из `PENDING` под `SELECT FOR UPDATE`.
+
+### Retry / DLQ
+
+Рабочая очередь → при `nack(requeue=False)` в retry (TTL) → обратно в рабочую.  
+После `MAX_RETRIES` сообщение уходит в dead-очередь (`payments.new.dead` / `payments.webhooks.dead`).
+
+---
+
+## API
+
+Авторизация: заголовок `X-API-Key` (значение из `.env`, по умолчанию в примере — `SecretKey`).
+
+### Создать платёж
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/payments/ \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: SecretKey" \
+  -H "Idempotency-Key: 7e4a99b8-bb7d-4af6-9dbf-8f62d463bafb" \
+  -d '{
+    "amount": 100.00,
+    "currency": "USD",
+    "description": "Order #123",
+    "metadata": {"user_id": 1},
+    "webhook_url": "https://example.com/webhook"
+  }'
 ```
 
-Body:
-
-```json
-{
-  "amount": 100.00,
-  "currency": "USD",
-  "description": "Order #123",
-  "metadata": {
-    "user_id": 1
-  },
-  "webhook_url": "https://example.com/webhook"
-}
-```
-
-Response `202`:
+Ответ `202`:
 
 ```json
 {
   "id": "5bfc4131-5a58-48d0-a0d3-c2bb16b16dd8",
-  "amount": 100.00,
+  "amount": "100.00",
   "currency": "USD",
   "status": "PENDING",
   "created_at": "2026-06-19T18:15:00.577431Z"
 }
 ```
 
-Повторный запрос с тем же `Idempotency-Key` возвращает уже созданный платёж без дублирования события.
+Тот же `Idempotency-Key` возвращает существующий платёж без второго outbox-события.
 
-## Получение платежа
+### Получить платёж
 
-### GET /api/v1/payments/{payment_id}
+```bash
+curl -s http://localhost:8080/api/v1/payments/<payment_id> \
+  -H "X-API-Key: SecretKey"
+```
 
-Headers:
+### Webhook payload
 
 ```http
-X-API-Key: SecretKey
+POST <webhook_url>
+X-Event-Id: <uuid>
+Content-Type: application/json
+
+{"payment_id": "<uuid>", "status": "SUCCESS"}
 ```
 
 ---
 
-# Outbox Pattern
+## Структура кода
 
-При создании платежа событие пишется в таблицу `outbox` в одной транзакции с записью платежа.
-`outbox_worker` читает unpublished-сообщения (`FOR UPDATE SKIP LOCKED`), публикует в RabbitMQ и помечает как опубликованные.
-
-Повторная доставка возможна при сбое после publish до commit — consumer идемпотентен (обработка только `PENDING` + `SELECT FOR UPDATE`).
-
----
-
-# Обработка платежей
-
-Consumer читает `payments.new`, эмулирует шлюз и в **одной транзакции**:
-
-* меняет статус на `SUCCESS` / `FAILED`
-* выставляет `processed_at`
-* при наличии `webhook_url` кладёт событие webhook в outbox
-
----
-
-# Webhook
-
-После обработки outbox публикует событие в `payments.webhooks`.
-Consumer отправляет HTTP POST:
-
-```json
-{
-  "payment_id": "<uuid>",
-  "status": "SUCCESS"
-}
+```text
+src/
+  app/        # routes, DTO, use cases
+  domains/    # сущности и правила платежей
+  infra/      # ORM, RabbitMQ, outbox, consumer
+  core/       # settings, security
 ```
 
-Header: `X-Event-Id`.
+Compose-сервисы: `app`, `outbox_worker`, `consumer_worker`, `migrations`, `postgres`, `rabbitmq`.  
+В контейнерах конфиг — `config.docker.yml` (`CONFIG_FILE`).
 
 ---
 
-# Retry и DLQ
-
-Схема брокера:
-
-* рабочие очереди (`payments.new`, `payments.webhooks`) с DLX → retry-exchange
-* retry-очереди с TTL (`RETRY_TTL_MS`) и DLX обратно в рабочую очередь
-* при `nack(requeue=False)` сообщение уходит в retry, затем возвращается с заголовком `x-death`
-* после `MAX_RETRIES` consumer публикует сообщение в DLQ (`payments.new.dead` / `payments.webhooks.dead`) и делает `ack`
-
----
-
-# Тестирование
+## Миграции и тесты
 
 ```bash
-cp config.example.yml config.yml
-cp .env.example .env
-poetry install
-poetry run pytest
-```
+alembic revision --autogenerate -m "change"
+alembic upgrade head
 
-```bash
 poetry run pytest tests/units
-poetry run pytest tests/integrations
+poetry run pytest tests/integrations   # нужен совместимый TESTING.DB_URL (PostgreSQL)
 ```
+
+В Docker миграции гоняет сервис `migrations` до старта API.
